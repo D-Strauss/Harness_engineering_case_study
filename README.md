@@ -1,230 +1,228 @@
-# Agent-Assisted Development Workflow
+# Engineering a Harness for Agentic Research Work
 
-Building software with AI coding agents introduces a new category of engineering problems. The agent has no memory between sessions, drifts from instructions in long contexts, and can't tell you when it's confused — it just guesses. Left unconstrained, it produces code that works in isolation but violates project conventions, duplicates existing patterns, and accumulates invisible debt.
+*A case study in making coding agents reliable on work where mistakes are expensive.*
 
-This document describes the workflow I've developed to make AI agents reliable contributors to a production codebase. The core insight: **treat the agent like a junior developer who needs excellent onboarding docs, a structured process, and code review from someone who wasn't in the room when the code was written.**
+## The problem
 
----
+I run coding agents on a research codebase with three properties that make naive agent use dangerous:
 
-## The Problem
+1. **Hostile data.** The dataset contains attack code. An agent that reads, prints, commits or executes it carelessly causes real harm.
+2. **Pre-registered science.** Evaluation rules are frozen before results exist. An agent that "helpfully" adjusts a threshold or loosens a failing test invalidates the study.
+3. **Long horizons.** The work spans many sessions and two studies. Agents have no memory between sessions, and decisions made in week one must still bind in week eight.
 
-AI coding agents are stateless. Every session starts from zero. This creates three failure modes:
+Prompting the agent to be careful does not solve this. A harness does: the files, commands, subagents and hooks around the model that decide what it can see, do and claim.
 
-1. **Context loss** — The agent doesn't know what you built yesterday, what conventions you've established, or where you left off. It re-derives everything from scratch, often differently.
-2. **Drift** — In long sessions, the agent gradually forgets earlier instructions. It starts following its own conventions instead of yours. By the end of a long session, the code style may have shifted.
-3. **Invisible confidence** — The agent never says "I'm not sure." It commits to an approach and executes it fluently, even when the approach contradicts project constraints it was told about 40 messages ago.
-
-## The Solution
-
-Three interlocking systems that compensate for these failure modes:
+## Architecture at a glance
 
 ```mermaid
 flowchart TB
-    subgraph Rules["CLAUDE.md — Agent Constitution"]
-        CONTRACTS["Module contracts + type signatures"]
-        CONSTRAINTS["Core constraints"]
-        FLAGS["Flag vocabulary"]
-        IMPORTS["Import boundaries"]
+    H([Human])
+
+    subgraph Memory["Repository as memory and rulebook"]
+        direction LR
+        R["CLAUDE.md<br/>(always loaded)"] --> D["Decision log<br/>(source of truth)"]
+        D --> S["Scope docs<br/>(why)"]
+        D --> P["PRDs<br/>(what + acceptance criteria)"]
+        D --> G["Method guides<br/>(how)"]
     end
 
-    subgraph Commands["Slash Commands — Encoded Process"]
-        PLAN["/planning"]
-        EXEC["/execute"]
-        REVIEW["/code-review"]
-        SHIP["/commit + /summarize-changes"]
-        META["/system-review"]
+    subgraph Workflow["Workflow layer"]
+        direction LR
+        C["Slash commands"] --> A["Subagents<br/>(narrow powers)"]
+        C --> K["Skills"]
     end
 
-    subgraph Memory["Persistent Memory — Markdown Files"]
-        TRAIL["active-trail.md"]
-        ROAD["roadmap.md"]
-        PLANS["docs/plans/"]
-        REPORTS["docs/reports/"]
-        DECISIONS["decisions.md"]
+    subgraph Enforce["Enforcement layer"]
+        direction LR
+        PM["Permission denies"] --- HK["PreToolUse hooks"] --- GT["Validation gate"]
     end
 
-    Rules -->|constrains| Commands
-    Commands -->|produces| Memory
-    Memory -->|loads into| Commands
+    subgraph Trace["Trace layer"]
+        direction LR
+        PL["Plans"] --- RP["Reports and reviews"] --- FL["Flow logs"] --- CL["Changelog + Context blocks"]
+    end
 
-    style Rules fill:#1a1a2e,color:#eee,stroke:#e94560
-    style Commands fill:#16213e,color:#eee,stroke:#0f3460
-    style Memory fill:#1a1a2e,color:#eee,stroke:#e94560
+    H -->|decides| D
+    Memory -->|read by| Workflow
+    Workflow -->|every tool call passes through| Enforce
+    Workflow -->|writes| Trace
+    Trace -.->|future sessions read| Memory
+    Workflow -->|findings 'for the user'| H
 ```
 
+## Design principles
 
+**1. Repository as memory and rulebook.** A short `CLAUDE.md` is loaded every session. It points at a decision log, which is the source of truth, and at scope docs (why), PRDs (what) and method guides (how). The agent reconstructs context from files, not from a previous conversation.
 
----
+**2. A decision log with status semantics.** Every decision is a row with an ID, date, status and rationale pointer. `accepted` rows bind, `proposed` rows are context, `superseded` rows are history. An agent that invents a default must log it as `proposed`. When a task conflicts with an accepted row, the agent stops and proposes a specific change instead of choosing silently. This turns "the agent made a call nobody noticed" into a visible, reviewable event.
 
-## 1. CLAUDE.md — The Agent's Constitution
+```mermaid
+stateDiagram-v2
+    [*] --> proposed: agent introduces a default
+    [*] --> accepted: human decides
+    [*] --> open: question needs deciding
+    proposed --> accepted: human confirms
+    open --> accepted: human settles
+    accepted --> superseded: new row replaces it
+    proposed --> superseded: new row replaces it
+    superseded --> [*]
+    note right of accepted: Binds. A conflicting task stops and proposes a change.
+    note right of proposed: Context only. Never binds.
+```
 
-Every AI coding tool reads a project rules file at session start. Most projects put a paragraph or two here. This project's `CLAUDE.md` is 300+ lines and serves as the single source of truth for how the codebase works.
+**3. Agents recommend, humans decide.** Design commands end with a ready-to-paste decision line, never a recorded decision. Every review step sorts findings into `fixed`, `not applied (why)` or `for the user`, and none is dropped silently.
 
-It contains:
+**4. Enforce with code, not prose.** Rules that must hold are implemented as hooks and permissions (see below). Prose rules cover judgment calls.
 
+**5. Fresh-context review.** Reviews run in subagents that see only an artefact path and task IDs, not the builder's conversation. Reviewing your own work in the same context shares its blind spots, so it does not count as a review.
 
-| Section               | What it encodes                                                    | Why it matters                                              |
-| --------------------- | ------------------------------------------------------------------ | ----------------------------------------------------------- |
-| **Module contracts**  | Input/output types for every pipeline stage                        | Agent can't invent new interfaces or pass wrong types       |
-| **Core constraints**  | Determinism, NFC normalization, flag-don't-guess, module isolation | Non-negotiable rules that every change must respect         |
-| **Flag vocabulary**   | 15 named flags, each with setter and meaning                       | Agent can't invent new flags or misuse existing ones        |
-| **Import boundaries** | Dependency graph between packages                                  | Agent can't create circular dependencies or break isolation |
-| **Storage layout**    | Every file path, who reads/writes what                             | Agent can't put files in the wrong place                    |
-| **Pipeline example**  | Full worked example from raw text to final output                  | Agent sees the exact transformation, not just a description |
+**6. Done means verified.** A task is ticked only after its acceptance criteria pass with a command the agent actually ran, citing the execution report. Tests cannot be weakened to make a failure go away; the code is fixed.
 
+**7. Every step leaves a trace.** Plans, execution reports, reviews, flow logs and per-commit changelog entries are files. Commits touching the AI layer carry a `Context:` block, so `git log` explains why a rule or command changed.
 
-The key design decision: **be exhaustively specific**. Vague rules ("keep it clean", "follow conventions") are worse than no rules because the agent thinks it's complying when it isn't. Specific rules ("use `structlog` with `document_id` bound, never `print()` or stdlib `logging`") are machine-verifiable.
+## Mechanisms
 
----
+### Hooks and permissions (the hard guarantees)
 
-## 2. Four-Session Development Cycle
+- **Read denies** on secrets, raw data and raw outputs, so file tools cannot open them.
+- **Frozen-file guard** (PreToolUse on file edits and Bash). It denies changes to committed pre-registration configs. It inspects shell routes too: redirects, `tee`, `sed -i`, `rm`, `mv`, `cp`, `git checkout`. Changing one requires a new decision row and the human's own commit.
+- **Test-weakening guard.** Changes to committed tests prompt for confirmation. An edit that only adds text passes, so extending tests is frictionless and weakening them needs a human yes.
+- **Commit gate.** A hook detects an actual `git commit` (not a mention of one), blocks forbidden staged paths, and runs lint, format check and tests. A failing gate blocks the commit.
 
-Every feature follows the same four-session cycle. Each session starts fresh — the agent loads context from files, not from conversation history.
+A blocked action is a stop. The agent reports it and does not route around it.
+
+```mermaid
+flowchart TD
+    T["Agent proposes a tool call"] --> Q{"Tool type?"}
+    Q -->|"Read"| RD{"Path in deny list?<br/>secrets, raw data, raw outputs"}
+    RD -->|yes| X1["Denied by permissions"]
+    RD -->|no| OK["Allowed"]
+    Q -->|"Edit / Write / Bash"| PF["Frozen-file and test guard"]
+    PF --> F1{"Writes a committed<br/>pre-registration file?"}
+    F1 -->|yes| X2["Deny: needs new decision row<br/>and the human's own commit"]
+    F1 -->|no| F2{"Changes a committed test?"}
+    F2 -->|"only adds text"| OK
+    F2 -->|"removes or edits"| ASK["Ask the human"]
+    F2 -->|no| GC{"Is it a real git commit?"}
+    GC -->|no| OK
+    GC -->|yes| FP{"Forbidden path staged?"}
+    FP -->|yes| X3["Block commit"]
+    FP -->|no| GATE["Run lint, format check, tests"]
+    GATE -->|fail| X3
+    GATE -->|pass| OK
+    X1 --> STOP(["Agent reports and stops;<br/>never works around"])
+    X2 --> STOP
+    X3 --> STOP
+```
+
+### Slash commands as a workflow
+
+Roughly fifteen commands encode the process: orient, brainstorm, plan, review the plan, execute, review the code, safety-check, commit, review the process, report. Each command file carries its own stop conditions, safety rules and output location, and writes its artefact to a known directory.
+
+Notable design choices:
+
+- **Plans bind to PRD task IDs** and name the acceptance command for each criterion before any code is written.
+- **Plans place every step on host or in a network-less container** and list "owner steps" (actions only the human can do) up front, so the run does not stall halfway.
+- **Reviews have a delta mode.** Later rounds review only what changed against a pinned snapshot, which keeps fix loops cheap.
+- **Fix loops are capped** (three rounds for plans, two elsewhere). When blockers remain, the run stops and reports.
+
+### An orchestrator: `/flow`
+
+One command runs the whole path: triage, plan, plan review, execute, code review, process review, findings report, then an **approval stop**, then commit.
+
+```mermaid
+flowchart TD
+    START(["/flow with task IDs"]) --> TR{"Triage:<br/>open design decision?"}
+    TR -->|yes| BR["Brainstorm"] --> HD(["Stop: human runs /decide,<br/>then re-runs /flow"])
+    TR -->|no| PLAN["Plan<br/>(bound to task IDs)"]
+    PLAN --> OWN["List owner steps,<br/>ask the human once"]
+    OWN --> RPL["Plan review<br/>(fresh subagent)"]
+    RPL -->|"blockers or gaps<br/>max 3 rounds"| FIXP["Fix plan"] --> RPLD["Delta review<br/>against pinned snapshot"]
+    RPLD --> RPL
+    RPL -->|ready| EX["Execute<br/>test first, container for risky steps"]
+    EX -->|"unmet criteria<br/>max 2 rounds"| EX
+    EX --> CR["Code review<br/>(fresh subagent)"]
+    CR -->|"blockers or issues<br/>max 2 rounds"| FIXC["Fix the code,<br/>never the test"] --> CRD["Delta review"]
+    CRD --> CR
+    CR -->|approve| SR["Process review<br/>(reads flow log only)"]
+    SR --> FR["Findings report<br/>(HTML from result JSON)"]
+    FR --> AP{"Approval stop:<br/>commit packet"}
+    AP -->|changes| EX
+    AP -->|approved| CM["Commit<br/>code + config split"]
+    AP -->|declined| END1(["Leave tree as is,<br/>log the stop"])
+    CM --> DONE([Final reply:<br/>'for the user' first])
+
+    RPL -.->|stop condition| STOP(["Stop and report;<br/>never half-commit"])
+    EX -.-> STOP
+    CR -.-> STOP
+```
+
+- **Triage** decides whether the work needs a brainstorm first. Triggers include several viable designs, hard-to-undo changes, and conflicts with accepted decisions. If so, the flow stops for the human's decision.
+- **The flow never commits without approval.** It presents a short commit packet: files, verdicts, everything "for the user", proposed messages. The packet is deliberately readable in about a minute, because a gate people skip is not a gate.
+- **A flow log** records divergences as they happen (user corrections, stops, retries, gate failures), a gate ledger of what each gate caught and what escaped it, and token estimates per step.
+
+### Subagents with narrow powers
+
+| Agent | Powers | Why |
+|---|---|---|
+| Plan reviewer | Read-only, cannot write files | Cannot "fix" what it reviews |
+| Code reviewer | Writes one file: its report | Findings go to the author |
+| Decision advisor | Read-only, stronger model | Weighs 2–4 real options against the log and data; returns one recommendation, records nothing |
+| Researcher | Web access, writes a guide | Produces sourced best-practice briefings written for other agents |
+
+Reviewers read their command file themselves, so the command stays the single source of truth for the procedure.
+
+### Skills for the project lifecycle and for harness upkeep
+
+- **Greenfield and retrofit:** scoping interview, bootstrap (phased, resumable via a status file), brownfield bootstrap, problem-first PRD, architecture exploration.
+- **Design assurance:** a skill that finds the methods a study rests on and turns them into research prompts, and audits PRDs for contradictions and unsupported assumptions.
+- **Keeping the harness true:** one skill checks the rules file against recent changes, another checks the remaining docs for drift. A skill for authoring skills closes the loop.
+
+Each kind of drift has exactly one owner, so checks do not overlap or leave gaps.
+
+## Feedback loops
+
+| Loop | Mechanism |
+|---|---|
+| Inner | Test-first for core modules; validation gate enforced by hook |
+| Review | Fresh-context reviewers, capped rounds, delta reviews |
+| Review of the reviews | A shadow round runs the previous review procedure against the new one and a judge compares what each caught, to detect regressions when I make reviews cheaper |
+| Process | A process review reads the flow log and proposes edits to commands, skills and rules. Low-risk edits are applied; edits to rules, hooks or settings are proposed to the human with an exact diff |
+| Human | Approval stop before commits, checkpoints at block boundaries, and a plain-language findings page built from result files |
 
 ```mermaid
 flowchart LR
-    P["1. PLAN"] --> B["2. BUILD"]
-    B --> R["3. REVIEW"]
-    R --> S["4. SHIP"]
-
-    P -.->|artifact| PD["plans/feature.md"]
-    B -.->|artifact| ER["execution-report.md"]
-    R -.->|artifact| CR["code-review.md"]
-    S -.->|artifact| CL["changelog/NNN.md"]
-
-    style P fill:#e8f4f8
-    style B fill:#fff3e0
-    style R fill:#e8f5e9
-    style S fill:#f3e5f5
+    subgraph Inner["Inner loop"]
+        TDD["Test first"] --> GT["Validation gate<br/>(hook-enforced)"]
+    end
+    subgraph Review["Review loop"]
+        RV["Fresh-context review"] --> FX["Capped fix rounds"] --> DL["Delta review"]
+    end
+    subgraph Process["Process loop"]
+        FLG["Flow log:<br/>divergences + gate ledger"] --> SYS["Process review"]
+        SYS -->|"low-risk edits"| CMD["Commands and skills"]
+        SYS -->|"rules, hooks, settings"| HUM["Human approves diff"]
+    end
+    subgraph Shadow["Review of the reviews"]
+        OLD["Previous procedure"] --> JDG["Judge compares<br/>what each caught"]
+        NEW["New procedure"] --> JDG
+    end
+    Inner --> Review --> Process
+    Shadow -.->|"detects lost blockers"| Review
+    CMD -.->|"next run"| Inner
+    HUM -.->|"next run"| Inner
 ```
 
+## What I would point to
 
+- **Safety is layered.** Read denies, container isolation, tracked-file scrubbing and no-execute rules mean no single mistake exposes or runs the data.
+- **Scarce context is managed deliberately.** Heavy reading goes to subagents, state lives in files, and the main session keeps decisions and summaries.
+- **The process improves itself under supervision.** The harness reviews its own runs but cannot rewrite its own guardrails without a human.
+- **Human attention is budgeted.** Stops are rare, specific and cheap to answer.
 
-**Why separate sessions?** Two reasons:
+## Limitations and open problems
 
-1. **Review without implementation bias.** The reviewing agent has zero context from the build session. It reads the code from disk and evaluates it against `CLAUDE.md` contracts — the same way a human reviewer reads a PR they didn't write. This catches drift that occurred during the build.
-2. **Context budget management.** Build sessions are expensive — context grows fast as the agent reads files, writes code, and runs tests. By the end, the agent is working with degraded attention. Starting fresh for review means the reviewer operates at full capacity.
-
-Each session produces a **persisted artifact** (plan doc, execution report, code review, changelog). These are the agent's long-term memory — not conversation logs, but structured documents that any future session can load.
-
----
-
-## 3. Slash Commands — Encoded Process
-
-The workflow is encoded in 18 slash commands. Each command is a markdown file that the agent reads as instructions. The commands aren't suggestions — they're protocols with specific steps, output formats, and verification gates.
-
-### Development Flow
-
-
-| Command              | What it does                                 | Key mechanism                                                                        |
-| -------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `/prime`             | Orient agent at session start                | Reads roadmap + active trail, checks for staleness against `git log`                 |
-| `/brainstorm`        | Explore 2-4 approaches for a design decision | Produces comparison table with blast radius, reversibility, testing complexity       |
-| `/planning`          | Create implementation plan                   | 163-line protocol with blast radius analysis, import verification, API detail checks |
-| `/review-plan`       | Validate plan before building                | Catches gaps before expensive build session                                          |
-| `/execute`           | Implement from plan                          | Task-by-task with self-review after each task, validation gate before completion     |
-| `/code-review`       | Review code against contracts                | 8-phase review (contracts, isolation, logging, flagging, security, logic, tests)     |
-| `/fix-code-review`   | Address review findings                      | Reads saved review file, fixes each finding                                          |
-| `/commit`            | Conventional commit                          | Updates roadmap tracking automatically                                               |
-| `/system-review`     | Improve the process                          | Analyzes execution report for process bugs, recommends command/rule updates          |
-| `/summarize-changes` | Generate changelog                           | Cross-references with roadmap, publishes to Notion, checks golden files              |
-
-
-### Issue Workflow
-
-
-| Command          | What it does                                                                      |
-| ---------------- | --------------------------------------------------------------------------------- |
-| `/rca`           | Root cause analysis for a GitHub issue — traces code paths, assesses blast radius |
-| `/implement-fix` | Apply fix from RCA document                                                       |
-| `/rca-review`    | Review all RCAs for recurring patterns                                            |
-
-
-### Tooling
-
-
-| Command      | What it does                                                                          |
-| ------------ | ------------------------------------------------------------------------------------- |
-| `/analytics` | Analyze pipeline output — 300-line structured analysis with cross-document comparison |
-| `/validate`  | Run all checks (ruff, mypy, pytest) and auto-fix                                      |
-| `/test`      | Add or improve tests for a module                                                     |
-
-
-### The Planning Command in Detail
-
-The `/planning` command deserves special attention because it's where most of the accumulated wisdom lives. At 163 lines, it encodes lessons learned from dozens of plan-then-build cycles:
-
-- **Blast radius analysis** — Trace every system flow affected by the change. Check pipeline contracts, manuscript state transitions, storage layout, model constructors. When adding a field to a dataclass, grep every constructor call site.
-- **Import block verification** — Before finalizing imports, cross-check that every imported name actually appears in the task descriptions. Remove phantom imports.
-- **API detail verification** — When the plan specifies library API calls, verify against docs. Don't assert API behavior from training data alone.
-- **Plan size splitting** — If the plan exceeds 7 tasks or crosses dependency boundaries, split into sub-plans with explicit dependency handoff points.
-- **Frontend cross-checks** — For template+CSS changes, enumerate every CSS class used in HTML and verify it exists in the stylesheet.
-
-Each of these checks was added because a real build session diverged without it. The planning command is a living document of failure modes.
-
----
-
-## 4. Persistent Memory
-
-AI agents have no memory between sessions. These files compensate:
-
-### Active Trail — Tactical Bookmark
-
-A ~25-line file read at every session start. Contains:
-
-- **Current focus** — what you're working on, link to plan doc, session status
-- **Detours** — LIFO stack of branches from the main path (detours can nest)
-- **Up next** — Top 3 ready items from the roadmap
-
-The agent updates this automatically at each session boundary through the slash commands. No manual tracking required.
-
-### Roadmap — Strategic Position
-
-A visual timeline strip with a "YOU ARE HERE" marker plus an items table with status, effort, dependencies, and phase. Glance at it and know where you are in the overall build.
-
-### Decision Log
-
-Every non-obvious design decision is recorded in `docs/decisions/decisions.md` with resolution and rationale. When a future session asks "why does X work this way?", the answer is in the log — not buried in a conversation that expired months ago.
-
----
-
-## 5. Self-Improving Process
-
-The `/system-review` command closes the feedback loop. After each feature ships, it analyzes the execution report for **process bugs** — not code bugs:
-
-- Was the divergence justified (plan was wrong) or problematic (execution drifted)?
-- Where did the process break? Ambiguous plan? Missing constraint in `CLAUDE.md`? Unchecked edge case in the execute command?
-- What should change to prevent recurrence?
-
-This is how the planning command grew to 163 lines. Each check was a system review recommendation that proved its value. The process improves itself.
-
----
-
-## 6. Git as Agent Memory
-
-Git is the one system that persists across all sessions and tools. The workflow uses it as long-term memory:
-
-- `**Context:` blocks** in commit messages document changes to AI context assets (commands, rules, `CLAUDE.md`). Future agents running `git log` can trace why a convention was introduced.
-- **Session ID git notes** — A post-commit hook (`attach_session_to_commit.py`) attaches the Claude session ID to each commit via `git notes`. This links commits to the conversation that produced them.
-- **Conventional commits** with module-scoped types (`feat(chunker):`, `fix(post-processor):`) make the evolution of each module traceable.
-
----
-
-## Results
-
-This workflow has produced 25+ features and fixes across a production codebase with:
-
-- Consistent code style across all agent-written code (structlog, dataclasses, module isolation)
-- Zero convention drift — the 50th feature follows the same patterns as the 5th
-- Accumulated process improvements through system reviews
-- Full traceability from commit to conversation to design decision
-
-The tooling is portable: the same command set works in both Claude Code and Cursor (mirrored in `.claude/commands/` and `.cursor/commands/`). The approach generalizes to any AI coding agent that reads project-level instruction files.
-
----
-
-*The meta-lesson: AI coding agents are powerful but stateless. The engineering challenge isn't getting the agent to write code — it's building the scaffolding so it writes the right code, consistently, across hundreds of sessions.*
-
----
-
-Built by Dahni Strauss at [Accessible Futures AB](https://accessiblefutures.se).
+- Hook parsing of shell commands is heuristic. A determined or unusual command could slip past, so the hooks reduce risk and do not eliminate it.
+- Fresh-context review costs tokens. Delta mode and the shadow check exist to manage that, and the trade-off is not fully measured.
+- The harness is project-specific. The patterns transfer (decision log, status semantics, fresh-context review, hook-enforced invariants, approval packets). The commands themselves would need rewriting for another domain.
+- Token figures in the flow log are estimates of context added, not billing.
