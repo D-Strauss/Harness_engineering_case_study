@@ -1,6 +1,6 @@
 # Engineering a Harness for Agentic Research Work
 
-*A case study in making coding agents reliable on work where mistakes are expensive.*
+*A case study in in autonomic agentic work with sensitive and hostile data*
 
 ## The problem
 
